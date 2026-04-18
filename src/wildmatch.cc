@@ -389,12 +389,75 @@ namespace wildmatch
     return Napi::Number::New(env, result);
   }
 
+  Napi::Array WildMatchMany(const Napi::CallbackInfo &info)
+  {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 3 ||
+        !info[0].IsArray() || !info[1].IsArray() || !info[2].IsNumber())
+    {
+      Napi::TypeError::New(env, "Expected (patterns: string[], texts: string[], flags: number)")
+          .ThrowAsJavaScriptException();
+      return Napi::Array::New(env, 0);
+    }
+
+    Napi::Array patterns = info[0].As<Napi::Array>();
+    Napi::Array texts = info[1].As<Napi::Array>();
+    unsigned int flags = info[2].As<Napi::Number>().Uint32Value();
+
+    uint32_t pcount = patterns.Length();
+    uint32_t tcount = texts.Length();
+
+    std::vector<std::string> matchedTexts;
+    std::vector<bool> textMatched(tcount, false);
+
+    for (uint32_t pi = 0; pi < pcount; pi++)
+    {
+      Napi::Value patVal = patterns[pi];
+      if (!patVal.IsString())
+      {
+        Napi::TypeError::New(env, "All patterns must be strings")
+            .ThrowAsJavaScriptException();
+        return Napi::Array::New(env, 0);
+      }
+      std::string pattern = patVal.As<Napi::String>().Utf8Value();
+
+      for (uint32_t ti = 0; ti < tcount; ti++)
+      {
+        if (textMatched[ti]) continue;
+
+        Napi::Value txtVal = texts[ti];
+        if (!txtVal.IsString())
+        {
+          Napi::TypeError::New(env, "All texts must be strings")
+              .ThrowAsJavaScriptException();
+          return Napi::Array::New(env, 0);
+        }
+        std::string text = txtVal.As<Napi::String>().Utf8Value();
+        if (dowild(pattern.c_str(), text.c_str(), flags) == WM_MATCH)
+        {
+          textMatched[ti] = true;
+          matchedTexts.push_back(text);
+        }
+      }
+    }
+
+    Napi::Array results = Napi::Array::New(env, matchedTexts.size());
+    for (size_t i = 0; i < matchedTexts.size(); i++)
+    {
+      results.Set(i, Napi::String::New(env, matchedTexts[i]));
+    }
+    return results;
+  }
+
   Napi::Object Init(Napi::Env env, Napi::Object exports)
   {
     exports.Set(Napi::String::New(env, "wildmatch"),
                 Napi::Function::New(env, WildMatch));
     exports.Set(Napi::String::New(env, "wildmatchPos"),
                 Napi::Function::New(env, WildMatchPos));
+    exports.Set(Napi::String::New(env, "wildmatchMany"),
+                Napi::Function::New(env, WildMatchMany));
 
     exports.Set(Napi::String::New(env, "WM_CASEFOLD"),
                 Napi::Number::New(env, WM_CASEFOLD));

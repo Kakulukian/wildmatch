@@ -18,6 +18,7 @@ import { wildmatch } from "git-wildmatch";
 wildmatch("*.ts", "foo.ts"); // true
 wildmatch("src/**/*.ts", "src/a/b/c.ts", { pathname: true }); // true
 wildmatch("README.md", "readme.md", { casefold: true }); // true
+wildmatchMany(["*.ts", "src/**/*.ts"], ["foo.ts", "src/a/b/c.ts", "readme.md"], { pathname: true }); // Set { "foo.ts", "src/a/b/c.ts" }
 ```
 
 ## API

@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { Suite, chartReport } from "bench-node";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-import { wildmatch, WM_PATHNAME, WM_CASEFOLD } from "../dist/index.mjs";
+import { wildmatch, wildmatchMany, WM_PATHNAME, WM_CASEFOLD } from "../dist/index.mjs";
 import { ensureFile, parsePatterns } from "./generate-gitattributes.mjs";
 
 function formatNs(ns) {
@@ -141,6 +141,13 @@ suite.add("scan-all  WM_PATHNAME|CASEFOLD    midDirMatch", () => {
 
 suite.add("single wildmatch call (baseline)", () => {
   wildmatch("src/**/*.ts", "src/a/b/c/d/file.ts", WM_PATHNAME);
+});
+
+// Batch: scan all 10k patterns against all 10 paths in one native call
+const ALL_PATHS = Object.values(PATHS);
+suite.add("batch-scan 10k×10paths  WM_PATHNAME", () => {
+  const matched = wildmatchMany(patterns, ALL_PATHS, WM_PATHNAME);
+  // matched is now Set<string> of texts that matched at least one pattern
 });
 
 console.log(`Loaded ${patterns.length} patterns from ${path.relative(process.cwd(), FILE)}`);

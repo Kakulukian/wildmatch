@@ -15,6 +15,7 @@ export interface WildmatchFlags {
 interface WildmatchAddon {
   wildmatch(pattern: string, text: string, flags: number): boolean;
   wildmatchPos(pattern: string, text: string, flags: number): number;
+  wildmatchMany(patterns: string[], texts: string[], flags: number): string[];
 }
 
 const addon = bindings<WildmatchAddon>(join(__dirname, ".."));
@@ -27,16 +28,30 @@ function flagsToNumber(flags?: WildmatchFlags): number {
   return result;
 }
 
-export function wildmatch(pattern: string, text: string, flags?: WildmatchFlags | number): boolean {
+export function wildmatch(
+  pattern: string,
+  path: string,
+  flags?: WildmatchFlags | number,
+): boolean {
   const flagsNum = typeof flags === "number" ? flags : flagsToNumber(flags);
-  return addon.wildmatch(pattern, text, flagsNum);
+  return addon.wildmatch(pattern, path, flagsNum);
 }
 
 export function wildmatchPos(
   pattern: string,
-  text: string,
+  path: string,
   flags?: WildmatchFlags | number,
 ): number {
   const flagsNum = typeof flags === "number" ? flags : flagsToNumber(flags);
-  return addon.wildmatchPos(pattern, text, flagsNum);
+  return addon.wildmatchPos(pattern, path, flagsNum);
+}
+
+export function wildmatchMany(
+  patterns: string[],
+  paths: string[],
+  flags?: WildmatchFlags | number,
+): Set<string> {
+  const flagsNum = typeof flags === "number" ? flags : flagsToNumber(flags);
+  const result: string[] = addon.wildmatchMany(patterns, paths, flagsNum);
+  return new Set(result);
 }
