@@ -25,6 +25,7 @@
   "files": [
     "dist",
     "binding.gyp",
+    "src",
     "prebuilds"
   ],
   "type": "module",
