@@ -4,7 +4,6 @@
   "description": "Native NAPI implementation of git's wildmatch pattern matching",
   "files": [
     "dist",
-    "src",
     "binding.gyp",
     "prebuilds"
   ],
