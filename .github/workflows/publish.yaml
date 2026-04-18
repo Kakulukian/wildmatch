@@ -128,7 +128,7 @@ jobs:
           merge-multiple: true
 
       - name: Install node_modules
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Build
         run: pnpm build
