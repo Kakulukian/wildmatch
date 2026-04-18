@@ -1,0 +1,36 @@
+# deps & build output
+node_modules/
+dist/
+build/
+prebuilds/
+*.tsbuildinfo
+
+# native build artifacts
+*.node
+*.o
+*.obj
+*.a
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# bench-generated fixtures
+bench/.gitattributes-*
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# tooling
+.claude/
+.cache/
+coverage/
+.env
+.env.local
