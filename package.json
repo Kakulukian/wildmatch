@@ -2,6 +2,26 @@
   "name": "git-wildmatch",
   "version": "1.0.0",
   "description": "Native NAPI implementation of git's wildmatch pattern matching",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kakulukian/wildmatch.git"
+  },
+  "homepage": "https://github.com/Kakulukian/wildmatch#readme",
+  "bugs": {
+    "url": "https://github.com/Kakulukian/wildmatch/issues"
+  },
+  "keywords": [
+    "git",
+    "wildmatch",
+    "gitignore",
+    "gitattributes",
+    "pathspec",
+    "glob",
+    "pattern",
+    "match",
+    "napi",
+    "native"
+  ],
   "files": [
     "dist",
     "binding.gyp",
