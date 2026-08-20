@@ -15,7 +15,7 @@ export interface WildmatchFlags {
 interface WildmatchAddon {
   wildmatch(pattern: string, text: string, flags: number): boolean;
   wildmatchPos(pattern: string, text: string, flags: number): number;
-  wildmatchMany(patterns: string[], texts: string[], flags: number): string[];
+  wildmatchMany(patterns: string[], texts: string[], flags: number): Uint32Array;
 }
 
 const addon = bindings<WildmatchAddon>(join(__dirname, ".."));
@@ -52,6 +52,11 @@ export function wildmatchMany(
   flags?: WildmatchFlags | number,
 ): Set<string> {
   const flagsNum = typeof flags === "number" ? flags : flagsToNumber(flags);
-  const result: string[] = addon.wildmatchMany(patterns, paths, flagsNum);
-  return new Set(result);
+  // The addon returns the indices of the matching paths; materialising the
+  // strings again on the native side would cost two boundary crossings each.
+  const indices = addon.wildmatchMany(patterns, paths, flagsNum);
+
+  const out = new Set<string>();
+  for (let i = 0; i < indices.length; i++) out.add(paths[indices[i]]);
+  return out;
 }

@@ -1,6 +1,8 @@
 #include <napi.h>
 #include <cstring>
 #include <cctype>
+#include <string>
+#include <vector>
 
 namespace wildmatch
 {
@@ -341,6 +343,345 @@ namespace wildmatch
     return *text ? WM_NOMATCH : WM_MATCH;
   }
 
+
+  // ---------------------------------------------------------------------
+  // Compiled patterns
+  //
+  // Profiling the batch path showed dowild() dominating once the N-API
+  // marshalling was fixed, and the overwhelming majority of real-world
+  // pattern sets (.gitignore / .gitattributes) are two trivial shapes:
+  // a plain literal, and "*" followed by a literal tail ("*.ts", "*/foo.c").
+  // Recognising those once per call lets most (pattern, text) pairs be
+  // decided with a memcmp instead of the recursive matcher.
+  // ---------------------------------------------------------------------
+
+
+  // ---------------------------------------------------------------------
+  // String arena
+  //
+  // Utf8Value() heap-allocates one std::string per element, so a batch call
+  // with T paths costs T mallocs before any matching happens. The arena takes
+  // the lengths in one pass, allocates a single buffer, and copies every string
+  // into it — one allocation total, and the texts end up contiguous in memory.
+  // ---------------------------------------------------------------------
+  struct StringArena
+  {
+    std::vector<char> buf;
+    std::vector<uint32_t> offset; // n entries
+    std::vector<uint32_t> length; // n entries
+
+    const char *at(size_t i) const { return buf.data() + offset[i]; }
+    size_t len(size_t i) const { return length[i]; }
+  };
+
+  // Returns false (with a pending JS TypeError) if any element is not a string.
+  //
+  // Two boundary crossings per element: fetch the value, then copy the UTF-8
+  // bytes straight into the arena. There is deliberately no separate "ask for
+  // the length" pass — the copy targets whatever room is left and only retries
+  // (with a bigger arena) when the result could have been truncated.
+  inline bool fill_arena(Napi::Env env, const Napi::Array &arr, uint32_t count,
+                         StringArena &out, const char *errMsg)
+  {
+    out.offset.resize(count);
+    out.length.resize(count);
+
+    // 48 bytes per element covers the overwhelming majority of paths and
+    // patterns; longer ones just trigger a growth step.
+    size_t pos = 0;
+    out.buf.resize(count ? count * 48 + 64 : 64);
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+      napi_value v = arr[i];
+
+      while (true)
+      {
+        size_t avail = out.buf.size() - pos;
+        if (avail < 64)
+        {
+          out.buf.resize(out.buf.size() * 2 + 64);
+          continue;
+        }
+        size_t written = 0;
+        napi_status st =
+            napi_get_value_string_utf8(env, v, out.buf.data() + pos, avail, &written);
+        if (st != napi_ok)
+        {
+          if (st == napi_string_expected)
+            Napi::TypeError::New(env, errMsg).ThrowAsJavaScriptException();
+          else
+            Napi::Error::New(env, "Failed to read string").ThrowAsJavaScriptException();
+          return false;
+        }
+        if (written == avail - 1)
+        {
+          // Might have been truncated (or fit exactly) — grow and redo to be sure.
+          out.buf.resize(out.buf.size() * 2 + 64);
+          continue;
+        }
+        out.offset[i] = static_cast<uint32_t>(pos);
+        // dowild() is C-string based and stops at the first NUL, so the length
+        // the fast paths use must stop there too — otherwise a text containing
+        // a NUL would be matched differently by wildmatchMany than by wildmatch.
+        out.length[i] =
+            static_cast<uint32_t>(strnlen(out.buf.data() + pos, written));
+        pos += written + 1;
+        break;
+      }
+    }
+    return true;
+  }
+
+
+  struct Lit
+  {
+    const char *p;
+    uint32_t len;
+  };
+
+  struct PatternSet
+  {
+    std::vector<Lit> literals;          // no glob specials -> exact equality
+    std::vector<Lit> suffixes;          // '*' + non-empty literal tail
+    std::vector<const char *> generics; // everything else -> dowild()
+    bool bareStar = false;              // the pattern "*" itself
+
+    // Suffix patterns bucketed by the last byte of their tail. A text can only
+    // be matched by suffixes whose tail ends in the text's own last byte, so a
+    // text scans one bucket instead of every suffix pattern. Built with a
+    // counting sort over 256 buckets — no per-pattern allocation.
+    std::vector<Lit> bucketed;
+    uint32_t bucketStart[257] = {0};
+    bool indexed = false;
+
+    // Generic patterns bucketed by their first byte when that byte is an
+    // ordinary character: dowild() can only match a text starting with it.
+    // Patterns beginning with a glob special go in the trailing "always"
+    // bucket, which every text scans.
+    std::vector<const char *> genBucketed;
+    // Parallel to genBucketed: the byte the text must end with for this pattern
+    // to have any chance, or 0 when the pattern imposes no such constraint.
+    // Kept in its own array so the scan streams one byte per candidate and only
+    // touches the 8-byte pointer for the few that survive.
+    std::vector<unsigned char> genLastByte;
+    uint32_t genBucketStart[258] = {0};
+    bool genIndexed = false;
+  };
+
+  // If a pattern ends in an ordinary character, the whole pattern must consume
+  // the whole text, so that character has to equal the text's last byte. Returns
+  // 0 when the final element is a wildcard, a character class, or an escape,
+  // i.e. when no such constraint can be derived.
+  inline unsigned char required_last_byte(const char *p, size_t len)
+  {
+    if (!len)
+      return 0;
+    char c = p[len - 1];
+    if (c == '*' || c == '?' || c == ']' || c == '\\')
+      return 0;
+    return static_cast<unsigned char>(c);
+  }
+
+  inline bool starts_with_special(const char *p, size_t len)
+  {
+    if (!len)
+      return true;
+    char c = p[0];
+    return c == '*' || c == '?' || c == '[' || c == '\\';
+  }
+
+  inline bool has_glob_special(const char *s, size_t len)
+  {
+    for (size_t i = 0; i < len; i++)
+    {
+      char c = s[i];
+      if (c == '*' || c == '?' || c == '[' || c == '\\')
+        return true;
+    }
+    return false;
+  }
+
+  // Case-folding stays entirely on the generic path, so the fast kinds are only
+  // ever chosen when they are exactly equivalent to dowild().
+  inline void compile_into(PatternSet &set, const char *raw, size_t len, unsigned int flags)
+  {
+    if (flags & WM_CASEFOLD)
+    {
+      set.generics.push_back(raw);
+      return;
+    }
+
+    if (!has_glob_special(raw, len))
+    {
+      set.literals.push_back({raw, static_cast<uint32_t>(len)});
+      return;
+    }
+
+    if (raw[0] == '*' && !has_glob_special(raw + 1, len - 1))
+    {
+      if (len == 1)
+        set.bareStar = true;
+      else
+        set.suffixes.push_back({raw + 1, static_cast<uint32_t>(len - 1)});
+      return;
+    }
+
+    set.generics.push_back(raw);
+  }
+
+  // Bucketing costs ~256 counter operations to build and saves roughly
+  // (patterns - patterns/buckets) comparisons per text, so it pays for itself
+  // once patterns x texts is large enough. A fixed pattern-count threshold got
+  // this wrong for small path lists, where the sort never amortises, and for
+  // 50-pattern/200-path calls, where it very much does.
+  inline bool index_worth_it(size_t patterns, size_t texts)
+  {
+    return patterns >= 4 && patterns * texts >= 1024;
+  }
+
+  inline void build_suffix_index(PatternSet &set, uint32_t tcount)
+  {
+    if (!index_worth_it(set.suffixes.size(), tcount))
+      return;
+
+    uint32_t counts[257] = {0};
+    for (const Lit &l : set.suffixes)
+      counts[static_cast<unsigned char>(l.p[l.len - 1]) + 1]++;
+    for (int i = 1; i < 257; i++)
+      counts[i] += counts[i - 1];
+    for (int i = 0; i < 257; i++)
+      set.bucketStart[i] = counts[i];
+
+    set.bucketed.resize(set.suffixes.size());
+    uint32_t cursor[256];
+    for (int i = 0; i < 256; i++)
+      cursor[i] = set.bucketStart[i];
+    for (const Lit &l : set.suffixes)
+      set.bucketed[cursor[static_cast<unsigned char>(l.p[l.len - 1])]++] = l;
+
+    set.indexed = true;
+  }
+
+  inline void build_generic_index(PatternSet &set, unsigned int flags, uint32_t tcount)
+  {
+    if ((flags & WM_CASEFOLD) || !index_worth_it(set.generics.size(), tcount))
+      return;
+
+    // Bucket 256 is the "always scan" bucket.
+    uint32_t counts[258] = {0};
+    for (const char *g : set.generics)
+    {
+      size_t len = std::strlen(g);
+      uint32_t b = starts_with_special(g, len)
+                       ? 256u
+                       : static_cast<unsigned char>(g[0]);
+      counts[b + 1]++;
+    }
+    for (int i = 1; i < 258; i++)
+      counts[i] += counts[i - 1];
+    for (int i = 0; i < 258; i++)
+      set.genBucketStart[i] = counts[i];
+
+    set.genBucketed.resize(set.generics.size());
+    set.genLastByte.resize(set.generics.size());
+    uint32_t cursor[257];
+    for (int i = 0; i < 257; i++)
+      cursor[i] = set.genBucketStart[i];
+    for (const char *g : set.generics)
+    {
+      size_t len = std::strlen(g);
+      uint32_t b = starts_with_special(g, len)
+                       ? 256u
+                       : static_cast<unsigned char>(g[0]);
+      uint32_t slot = cursor[b]++;
+      set.genBucketed[slot] = g;
+      set.genLastByte[slot] = required_last_byte(g, len);
+    }
+
+    set.genIndexed = true;
+  }
+
+  inline bool matches_any(const PatternSet &set, const char *text,
+                          size_t textLen, unsigned int flags)
+  {
+    const bool pathname = (flags & WM_PATHNAME) != 0;
+
+    if (set.bareStar && (!pathname || std::memchr(text, '/', textLen) == nullptr))
+      return true;
+
+    for (const Lit &l : set.literals)
+    {
+      if (textLen == l.len && std::memcmp(text, l.p, l.len) == 0)
+        return true;
+    }
+
+    if (textLen)
+    {
+      unsigned char last = static_cast<unsigned char>(text[textLen - 1]);
+      const Lit *begin;
+      const Lit *end;
+      if (set.indexed)
+      {
+        begin = set.bucketed.data() + set.bucketStart[last];
+        end = set.bucketed.data() + set.bucketStart[last + 1];
+      }
+      else
+      {
+        begin = set.suffixes.data();
+        end = begin + set.suffixes.size();
+      }
+      for (const Lit *l = begin; l != end; ++l)
+      {
+        if (textLen < l->len)
+          continue;
+        size_t head = textLen - l->len;
+        if (std::memcmp(text + head, l->p, l->len) != 0)
+          continue;
+        // With WM_PATHNAME the leading '*' may not span a '/'.
+        if (pathname && std::memchr(text, '/', head) != nullptr)
+          continue;
+        return true;
+      }
+    }
+
+    if (!set.genIndexed)
+    {
+      for (const char *g : set.generics)
+      {
+        if (dowild(g, text, flags) == WM_MATCH)
+          return true;
+      }
+      return false;
+    }
+
+    unsigned char textLast =
+        textLen ? static_cast<unsigned char>(text[textLen - 1]) : 0;
+
+    // Scans the required-last-byte array (1 byte per candidate) and only calls
+    // the recursive matcher for the handful that can still match.
+    auto scanGeneric = [&](uint32_t from, uint32_t to) -> bool {
+      const unsigned char *req = set.genLastByte.data();
+      const char *const *pat = set.genBucketed.data();
+      for (uint32_t i = from; i < to; i++)
+      {
+        if (req[i] && req[i] != textLast)
+          continue;
+        if (dowild(pat[i], text, flags) == WM_MATCH)
+          return true;
+      }
+      return false;
+    };
+
+    if (textLen)
+    {
+      unsigned char first = static_cast<unsigned char>(text[0]);
+      if (scanGeneric(set.genBucketStart[first], set.genBucketStart[first + 1]))
+        return true;
+    }
+    return scanGeneric(set.genBucketStart[256], set.genBucketStart[257]);
+  }
+
   Napi::Boolean WildMatch(const Napi::CallbackInfo &info)
   {
     Napi::Env env = info.Env();
@@ -386,10 +727,45 @@ namespace wildmatch
     }
 
     int result = dowild(pattern.c_str(), text.c_str(), flags);
-    return Napi::Number::New(env, result);
+    // WM_ABORT_* are internal control values; callers only ever see
+    // WM_MATCH / WM_NOMATCH.
+    return Napi::Number::New(env, result == WM_MATCH ? WM_MATCH : WM_NOMATCH);
   }
 
-  Napi::Array WildMatchMany(const Napi::CallbackInfo &info)
+  // Shared sweep: compile, index, match (in parallel when it pays), and return
+  // the matching text indices as a Uint32Array.
+  inline Napi::Value run_many(Napi::Env env, const StringArena &patArena, uint32_t pcount,
+                              const StringArena &textArena, uint32_t tcount,
+                              unsigned int flags)
+  {
+    PatternSet set;
+    set.literals.reserve(pcount);
+    set.suffixes.reserve(pcount);
+    for (uint32_t pi = 0; pi < pcount; pi++)
+      compile_into(set, patArena.at(pi), patArena.len(pi), flags);
+    build_suffix_index(set, tcount);
+    build_generic_index(set, flags, tcount);
+
+    std::vector<uint32_t> matchedIdx;
+    for (uint32_t ti = 0; ti < tcount; ti++)
+    {
+      if (matches_any(set, textArena.at(ti), textArena.len(ti), flags))
+        matchedIdx.push_back(ti);
+    }
+
+    // Hand back the *indices* of the matching texts, not the strings. Copying
+    // one typed array is a single boundary crossing; setting m strings was two
+    // crossings per match (get the original value, set it on the result array).
+    Napi::Uint32Array results = Napi::Uint32Array::New(env, matchedIdx.size());
+    if (!matchedIdx.empty())
+    {
+      std::memcpy(results.Data(), matchedIdx.data(),
+                  matchedIdx.size() * sizeof(uint32_t));
+    }
+    return results;
+  }
+
+  Napi::Value WildMatchMany(const Napi::CallbackInfo &info)
   {
     Napi::Env env = info.Env();
 
@@ -408,46 +784,15 @@ namespace wildmatch
     uint32_t pcount = patterns.Length();
     uint32_t tcount = texts.Length();
 
-    std::vector<std::string> matchedTexts;
-    std::vector<bool> textMatched(tcount, false);
+    StringArena textArena;
+    if (!fill_arena(env, texts, tcount, textArena, "All texts must be strings"))
+      return Napi::Array::New(env, 0);
 
-    for (uint32_t pi = 0; pi < pcount; pi++)
-    {
-      Napi::Value patVal = patterns[pi];
-      if (!patVal.IsString())
-      {
-        Napi::TypeError::New(env, "All patterns must be strings")
-            .ThrowAsJavaScriptException();
-        return Napi::Array::New(env, 0);
-      }
-      std::string pattern = patVal.As<Napi::String>().Utf8Value();
+    StringArena patArena;
+    if (!fill_arena(env, patterns, pcount, patArena, "All patterns must be strings"))
+      return Napi::Array::New(env, 0);
 
-      for (uint32_t ti = 0; ti < tcount; ti++)
-      {
-        if (textMatched[ti]) continue;
-
-        Napi::Value txtVal = texts[ti];
-        if (!txtVal.IsString())
-        {
-          Napi::TypeError::New(env, "All texts must be strings")
-              .ThrowAsJavaScriptException();
-          return Napi::Array::New(env, 0);
-        }
-        std::string text = txtVal.As<Napi::String>().Utf8Value();
-        if (dowild(pattern.c_str(), text.c_str(), flags) == WM_MATCH)
-        {
-          textMatched[ti] = true;
-          matchedTexts.push_back(text);
-        }
-      }
-    }
-
-    Napi::Array results = Napi::Array::New(env, matchedTexts.size());
-    for (size_t i = 0; i < matchedTexts.size(); i++)
-    {
-      results.Set(i, Napi::String::New(env, matchedTexts[i]));
-    }
-    return results;
+    return run_many(env, patArena, pcount, textArena, tcount, flags);
   }
 
   Napi::Object Init(Napi::Env env, Napi::Object exports)
