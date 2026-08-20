@@ -1,6 +1,6 @@
 {
   "name": "git-wildmatch",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Native NAPI implementation of git's wildmatch pattern matching",
   "repository": {
     "type": "git",
