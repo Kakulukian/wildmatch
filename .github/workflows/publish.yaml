@@ -17,10 +17,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-26
             target: arm64
             cross-target: x64
-          - os: windows-latest
+          - os: windows-2025
             target: x64
             cross-target: arm64
 
@@ -60,7 +60,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x64
           - os: ubuntu-24.04-arm
             target: arm64
@@ -101,7 +101,7 @@ jobs:
       contents: "write"
       packages: "write"
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [prebuild, prebuild_linux]
     timeout-minutes: 30
 
