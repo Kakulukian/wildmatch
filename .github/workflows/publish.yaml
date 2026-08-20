@@ -20,7 +20,7 @@ jobs:
           - os: macos-26
             target: arm64
             cross-target: x64
-          - os: windows-2025
+          - os: windows-2022
             target: x64
             cross-target: arm64
 
